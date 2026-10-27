@@ -230,6 +230,9 @@ button.card{cursor:zoom-in}
 .timer .ic{width:18px;height:18px;color:var(--gild-l)}.timer b{font-size:16px;min-width:3.2ch}
 .timer.warn{background:#4a1d2a;border-color:var(--dmg);color:#ffd1c4;animation:tick 1s ease-in-out infinite}.timer.warn .ic{color:var(--dmg)}
 @keyframes tick{50%{box-shadow:0 0 0 4px #ff8f6b33}}
+/* гость: ход ушёл создателю комнаты и ещё не вернулся */
+.toast.sending{display:flex;align-items:center;gap:10px;color:var(--gild-l)}
+.toast.sending::before{content:"";flex:none;width:10px;height:10px;border-radius:50%;background:var(--gild-l);animation:tick 1s ease-in-out infinite}
 .netbar{margin:0 0 10px;padding:10px 14px;border-radius:10px;background:#3a1f1d;border:1px solid #7a3a2a;color:#ffd1c4}
 .badge.off{background:#3a1f1d;border-color:#7a3a2a;color:#ffc9a8}
 @media (max-width:700px){.topbar .timer{order:-1;margin-left:auto}}
@@ -1135,7 +1138,7 @@ function guestMsg(m) {
     Object.assign(NET, { reported: null, rated: null, rateErr: "", animated: false }); pending = null; overlay = null; render(); }
   else if (m.t === "refuse") { forgetRoom(); netReset(); onlineErr = m.why; render(); }
   else if (m.t === "state") {
-    NET.joined = true; NET.started = true; NET.seat = m.seat; setMeta(m.meta);
+    NET.joined = true; NET.started = true; NET.seat = m.seat; setMeta(m.meta); NET.sentAt = 0;
     const v = m.v; G = { ...v, mdeck: hidden(v.mdeckN), winner: v.winner != null ? v.players[v.winner] : null };
     if (pending && pending.cur !== G.cur) pending = null;
     render();
@@ -1530,8 +1533,7 @@ function render() {
   $app.innerHTML = `
   <div class="topbar"><h1>Битва Академиков</h1>
     <span class="turnchip">Раунд ${G.turn} · ходит <b>${esc(cur.name)}</b></span>
-    ${NET.on && !G.over ? `<span class="timer" id="tmr" role="timer" aria-label="Время хода">${icon("clock")}<b>1:30</b></span>` : ""}
-    <div class="row"><button class="btn" data-act="rules">Правила</button>${NET.on ? `<button class="btn" data-act="net-leave">Выйти</button>` : `<button class="btn" data-act="menu">Новая игра</button>`}</div></div>
+    ${NET.on && !G.over ? `<span class="timer" id="tmr" role="timer" aria-label="Время хода">${icon("clock")}<b>1:30</b></span>` : ""}    <div class="row"><button class="btn" data-act="rules">Правила</button>${NET.on ? `<button class="btn" data-act="net-leave">Выйти</button>` : `<button class="btn" data-act="menu">Новая игра</button>`}</div></div>
   ${NET.on && NET.hostLostAt && !NET.ended ? `<div class="netbar" role="alert">Нет связи с создателем комнаты. Переподключаемся… Если связь не вернётся за ${Math.ceil((OFFLINE_MS - (Date.now() - NET.hostLostAt)) / 60000)} мин, партия закончится.</div>` : ""}
   <div class="game"><div class="arena"><div class="surface main-col">
     <div class="opps">${oppHTML}</div>
@@ -1558,7 +1560,7 @@ function render() {
     <div><div class="lbl" style="margin-bottom:6px">Хроника</div><div class="logbox" id="log">${G.log.slice(-60).map(l => `<div class="${l.k}">${esc(l.t)}</div>`).join("")}</div></div>
   </aside></div>
   ${dockHTML(me, cur, myTurn, canAct)}
-  ${overlayHTML()}${toast ? `<div class="toast" role="status">${esc(toast)}</div>` : ""}`;
+  ${overlayHTML()}${toast ? `<div class="toast" role="status">${esc(toast)}</div>` : NET.on && !NET.host && NET.sentAt && Date.now() - NET.sentAt < 15000 ? `<div class="toast sending" role="status">Отправляем ход…</div>` : ""}`;
   const lb = document.getElementById("log"); if (lb) lb.scrollTop = lb.scrollHeight;
   lastStats = { p: me.id, ...st };
   playFx(me);
@@ -1843,7 +1845,8 @@ async function humanEnd() {
 
 // игровые действия. Гость по сети только отправляет их хозяину комнаты, а здесь они выполняются по-настоящему
 function doGame(act, id, n) {
-  if (NET.on && !NET.host) { if (G && !G.over) toHost({ t: "act", act, id, n }); return; }
+  // гость: действие уходит создателю комнаты и возвращается через сервер за пару секунд — показываем, что нажатие принято
+  if (NET.on && !NET.host) { if (G && !G.over) { toHost({ t: "act", act, id, n }); NET.sentAt = Date.now(); render(); } return; }
   const t = gameAct(act, id, n); if (t) showToast(t);
 }
 function gameAct(act, id, n) {
