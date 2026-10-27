@@ -887,7 +887,8 @@ function loadPeer() {
     document.head.appendChild(s);
   });
 }
-const peerErr = e => ({ "peer-unavailable": "Комната с таким кодом не найдена. Проверь код.", "network": "Нет связи с сервером. Проверь интернет.", "server-error": "Сервер соединений не отвечает. Попробуй позже.", "browser-incompatible": "Этот браузер не умеет играть по сети. Открой игру в Chrome или Safari." }[e && e.type] || (e && e.message) || "Не получилось подключиться.");
+const NET_HINT = " Проверь интернет. Если не помогает — подключись к другой сети, например к Wi-Fi вместо мобильного интернета.";
+const peerErr = e => ({ "peer-unavailable": "Комната с таким кодом не найдена. Проверь код.", "network": "Нет связи с сервером соединений." + NET_HINT, "server-error": "Сервер соединений не отвечает." + NET_HINT, "socket-error": "Связь с сервером соединений оборвалась." + NET_HINT, "browser-incompatible": "Этот браузер не умеет играть по сети. Открой игру в Chrome или Safari." }[e && e.type] || (e && e.message) || "Не получилось подключиться.");
 
 function forgetRoom() { try { sessionStorage.removeItem("ba-room"); } catch (e) {} }
 function netReset() {
@@ -903,11 +904,17 @@ async function netHost(name, open) {
   await loadPeer();
   netReset(); NET.on = true; NET.host = true; NET.name = cleanName(name); NET.open = !!open;
   NET.seats = [{ name: NET.name, cid: CID, conn: null, seen: Date.now(), off: null, token: ACC && ACC.token }];
-  for (let i = 0; i < 6 && !NET.peer; i++) {
+  // код занят — берём другой; сервер соединений не ответил — ещё две попытки с паузой
+  for (let i = 0, fails = 0; i < 8 && !NET.peer; i++) {
     const code = String(Math.floor(10000 + Math.random() * 90000));
     const peer = new Peer(PEER_PREFIX + code, { debug: 0 });
     try { await new Promise((res, rej) => { peer.on("open", res); peer.on("error", rej); }); NET.peer = peer; NET.code = code; }
-    catch (e) { peer.destroy(); if (e.type !== "unavailable-id") throw new Error(peerErr(e)); }
+    catch (e) {
+      peer.destroy();
+      if (e.type === "unavailable-id") continue;
+      if (["server-error", "network", "socket-error", "socket-closed"].includes(e.type) && ++fails < 3) { await new Promise(r => setTimeout(r, 1500 * fails)); continue; }
+      throw new Error(peerErr(e));
+    }
   }
   if (!NET.peer) throw new Error("Не получилось создать комнату. Попробуй ещё раз.");
   NET.peer.on("connection", conn => { conn.on("data", m => hostMsg(conn, m)); conn.on("close", () => hostClosed(conn)); });
@@ -1087,8 +1094,16 @@ function reportResult(loser = null, reason = "") {
 async function netJoin(name, code) {
   await loadPeer();
   netReset(); NET.on = true; NET.name = cleanName(name); NET.code = code;
-  NET.peer = new Peer({ debug: 0 });
-  await new Promise((res, rej) => { NET.peer.on("open", res); NET.peer.on("error", e => rej(new Error(peerErr(e)))); });
+  // сервер соединений не ответил — ещё две попытки с паузой
+  for (let fails = 0; ; ) {
+    NET.peer = new Peer({ debug: 0 });
+    try { await new Promise((res, rej) => { NET.peer.on("open", res); NET.peer.on("error", rej); }); break; }
+    catch (e) {
+      NET.peer.destroy();
+      if (["server-error", "network", "socket-error", "socket-closed"].includes(e.type) && ++fails < 3) { await new Promise(r => setTimeout(r, 1500 * fails)); continue; }
+      throw new Error(peerErr(e));
+    }
+  }
   NET.peer.on("error", e => {
     if (e.type === "peer-unavailable" && !NET.joined) { forgetRoom(); netReset(); onlineErr = peerErr(e); render(); }
   });
