@@ -845,18 +845,18 @@ if (typeof module !== "undefined") module.exports = { newGame, botTurn, DEF, def
 </script>
 <script>// ===== Битва Академиков: игра по сети =====
 // Хозяин комнаты — тот, кто её создал: в его браузере идёт вся партия (engine.js).
-// Остальные подключаются к нему напрямую (WebRTC через PeerJS), шлют свои действия
-// и получают только то, что им можно видеть: чужие руки и порядок колод скрыты.
+// Остальные шлют ему свои действия и получают только то, что им можно видеть:
+// чужие руки и порядок колод скрыты. Сообщения идут через «почтовые ящики» на сервере
+// (Google Apps Script): прямое соединение не проходит через раздачу с телефона и мобильные сети.
 const NET = {
-  on: false, host: false, seat: -1, code: "", name: "", peer: null, err: "",
-  seats: [],        // хозяин: [{name, cid, conn, seen, off}] — после старта индекс = id игрока
-  conn: null,       // гость: соединение с хозяином
+  on: false, host: false, seat: -1, code: "", name: "", err: "",
+  seats: [],        // хозяин: [{name, cid, conn, seen, off}] — conn: на связи ли; после старта индекс = id игрока
+  conn: false,      // гость: есть ли связь с хозяином
   lobby: [],        // гость: список мест в комнате
   started: false, joined: false,
   deadline: 0, warned: false, autoAnswer: false, asks: {}, askN: 0,
   meta: { off: [] }, hostLostAt: 0, ended: null, syncT: 0, loop: 0, lastPing: 0,
 };
-const PEER_PREFIX = "bitva-akademikov-v1-";
 const TURN_MS = 90000, WARN_MS = 15000, OFFLINE_MS = 120000, SILENT_MS = 15000;
 // у каждой вкладки свой id: по нему хозяин узнаёт вернувшегося игрока
 const CID = (() => { const r = () => Math.random().toString(36).slice(2, 10); try { let c = sessionStorage.getItem("ba-cid"); if (!c) { c = r(); sessionStorage.setItem("ba-cid", c); } return c; } catch (e) { return r(); } })();
@@ -878,67 +878,83 @@ async function api(action, data = {}) {
 let ACC = (() => { try { return JSON.parse(localStorage.getItem("ba-acc") || "null"); } catch (e) { return null; } })();
 function setAcc(a) { ACC = a; try { a ? localStorage.setItem("ba-acc", JSON.stringify(a)) : localStorage.removeItem("ba-acc"); } catch (e) {} }
 
-function loadPeer() {
-  if (window.Peer) return Promise.resolve();
-  return new Promise((res, rej) => {
-    const s = document.createElement("script");
-    s.src = "https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js";
-    s.onload = res; s.onerror = () => rej(new Error("Нет интернета: игра по сети не загрузилась."));
-    document.head.appendChild(s);
-  });
+// ---------- почта через сервер ----------
+// два потока: «приёмник» постоянно спрашивает свой ящик, «отправитель» сразу уносит новые сообщения
+const RELAY = { out: [], sendT: 0, sending: false, gen: 0, failAt: 0 };
+function relaySend(to, m) {
+  // снимок стола или лобби нужен только последний: старый ещё не ушедший выбрасываем
+  if (m.t === "state" || m.t === "lobby") RELAY.out = RELAY.out.filter(x => !(x.to === to && (x.m.t === "state" || x.m.t === "lobby")));
+  RELAY.out.push({ to, m });
+  if (!RELAY.sendT) RELAY.sendT = setTimeout(relayFlush, 30);
 }
-const NET_HINT = " Проверь интернет. Если не помогает — подключись к другой сети, например к Wi-Fi вместо мобильного интернета.";
-const peerErr = e => ({ "peer-unavailable": "Комната с таким кодом не найдена. Проверь код.", "network": "Нет связи с сервером соединений." + NET_HINT, "server-error": "Сервер соединений не отвечает." + NET_HINT, "socket-error": "Связь с сервером соединений оборвалась." + NET_HINT, "browser-incompatible": "Этот браузер не умеет играть по сети. Открой игру в Chrome или Safari." }[e && e.type] || (e && e.message) || "Не получилось подключиться.");
+async function relayFlush() {
+  RELAY.sendT = 0;
+  // после выхода из комнаты почта ещё дожидается последних сообщений, пока код комнаты не стёрт
+  if (RELAY.sending || !RELAY.out.length || !NET.code || !ACC) return;
+  RELAY.sending = true; const gen = RELAY.gen, out = RELAY.out.splice(0);
+  try { relayGot(await api("relay", { token: ACC.token, code: NET.code, me: NET.host ? "host" : CID, host: NET.host, out }), gen); }
+  catch (e) { if (gen === RELAY.gen) RELAY.out.unshift(...out); relayFail(); }
+  RELAY.sending = false;
+  if (RELAY.out.length && gen === RELAY.gen) RELAY.sendT = setTimeout(relayFlush, 300);
+}
+async function relayLoop(gen) {
+  while (NET.on && gen === RELAY.gen) {
+    try { relayGot(await api("relay", { token: ACC.token, code: NET.code, me: NET.host ? "host" : CID, host: NET.host, wait: 1200 }), gen); }
+    catch (e) { relayFail(); await new Promise(r => setTimeout(r, 2000)); }
+    await new Promise(r => setTimeout(r, 250));
+  }
+}
+function relayGot(r, gen) {
+  if (gen !== RELAY.gen || !NET.on) return;
+  RELAY.failAt = 0;
+  if (!NET.host) { NET.hostAge = r.hostAge; NET.seen = Date.now() - Math.max(0, r.hostAge); }
+  for (const m of r.in || []) NET.host ? hostMsg(m.from, m) : guestMsg(m);
+}
+function relayFail() { RELAY.failAt = RELAY.failAt || Date.now(); }
+function relayStart() { RELAY.gen++; RELAY.out = []; relayLoop(RELAY.gen); }
+function relayStop() { RELAY.gen++; RELAY.out = []; clearTimeout(RELAY.sendT); RELAY.sendT = 0; }
 
 function forgetRoom() { try { sessionStorage.removeItem("ba-room"); } catch (e) {} }
 function netReset() {
-  clearInterval(NET.loop); clearTimeout(NET.syncT);
-  try { NET.peer && NET.peer.destroy(); } catch (e) {}
-  Object.assign(NET, { on: false, host: false, seat: -1, code: "", peer: null, seats: [], conn: null, lobby: [], started: false, joined: false,
+  clearInterval(NET.loop); clearTimeout(NET.syncT); relayStop();
+  Object.assign(NET, { on: false, host: false, seat: -1, code: "", seats: [], conn: false, lobby: [], started: false, joined: false,
     deadline: 0, warned: false, autoAnswer: false, asks: {}, meta: { off: [] }, hostLostAt: 0, ended: null, syncT: 0, loop: 0,
     open: false, roomAt: 0, startErr: "", reported: null, rated: null, rateErr: "", animated: false });
 }
 
 // ---------- хозяин комнаты ----------
 async function netHost(name, open) {
-  await loadPeer();
-  netReset(); NET.on = true; NET.host = true; NET.name = cleanName(name); NET.open = !!open;
-  NET.seats = [{ name: NET.name, cid: CID, conn: null, seen: Date.now(), off: null, token: ACC && ACC.token }];
-  // код занят — берём другой; сервер соединений не ответил — ещё две попытки с паузой
-  for (let i = 0, fails = 0; i < 8 && !NET.peer; i++) {
+  netReset(); NET.name = cleanName(name); NET.open = !!open;
+  // занимаем свободный код комнаты на сервере
+  for (let i = 0; i < 6 && !NET.code; i++) {
     const code = String(Math.floor(10000 + Math.random() * 90000));
-    const peer = new Peer(PEER_PREFIX + code, { debug: 0 });
-    try { await new Promise((res, rej) => { peer.on("open", res); peer.on("error", rej); }); NET.peer = peer; NET.code = code; }
-    catch (e) {
-      peer.destroy();
-      if (e.type === "unavailable-id") continue;
-      if (["server-error", "network", "socket-error", "socket-closed"].includes(e.type) && ++fails < 3) { await new Promise(r => setTimeout(r, 1500 * fails)); continue; }
-      throw new Error(peerErr(e));
-    }
+    try { await api("relay", { token: ACC.token, code, me: "host", host: true, create: true }); NET.code = code; }
+    catch (e) { if (!/занят/.test(e.message)) throw e; }
   }
-  if (!NET.peer) throw new Error("Не получилось создать комнату. Попробуй ещё раз.");
-  NET.peer.on("connection", conn => { conn.on("data", m => hostMsg(conn, m)); conn.on("close", () => hostClosed(conn)); });
-  NET.peer.on("disconnected", () => { try { NET.peer.reconnect(); } catch (e) {} });
-  NET.peer.on("error", e => console.warn("peer", e.type));
+  if (!NET.code) throw new Error("Не получилось создать комнату. Попробуй ещё раз.");
+  NET.on = true; NET.host = true;
+  NET.seats = [{ name: NET.name, cid: CID, conn: true, seen: Date.now(), off: null, token: ACC && ACC.token }];
+  relayStart();
   NET.loop = setInterval(hostTick, 250);
   if (NET.open) announceRoom();
 }
 
-function hostMsg(conn, m) {
+function hostMsg(from, m) {
   if (!m || !m.t) return;
-  const s = NET.seats.find(x => x.conn === conn);
+  const s = NET.seats.find(x => x.cid === from && x.cid !== CID);
   if (m.t === "hello") {
-    const back = NET.seats.find(x => x.cid === m.cid && x.cid !== CID);
-    if (back) { back.conn = conn; back.seen = Date.now(); back.off = null; if (!NET.started) { back.name = cleanName(m.name); back.token = m.token; } resendAsks(NET.seats.indexOf(back)); netSync(); return; }
+    if (s) { s.conn = true; s.seen = Date.now(); s.off = null; if (!NET.started) { s.name = cleanName(m.name); s.token = m.token; } resendAsks(NET.seats.indexOf(s)); netSync(); render(); return; }
     const refuse = NET.started ? "Партия уже идёт, зрителей нет. Подожди следующую." : NET.seats.length >= 4 ? "В комнате уже 4 игрока." : !m.token ? "Сначала войди в аккаунт." : "";
-    if (refuse) { conn.send({ t: "refuse", why: refuse }); setTimeout(() => conn.close(), 400); return; }
-    NET.seats.push({ name: cleanName(m.name), cid: m.cid, conn, seen: Date.now(), off: null, token: m.token });
+    if (refuse) { relaySend(from, { t: "refuse", why: refuse }); return; }
+    NET.seats.push({ name: cleanName(m.name), cid: from, conn: true, seen: Date.now(), off: null, token: m.token });
     if (NET.open) announceRoom();
     netSync(); render(); return;
   }
   if (!s) return;
-  s.seen = Date.now(); s.off = null;
+  s.seen = Date.now();
   const i = NET.seats.indexOf(s);
+  // вернулся после обрыва: снова «на связи», недоделанный выбор отправляем ещё раз
+  if (!s.conn || s.off) { s.conn = true; s.off = null; resendAsks(i); netSync(); render(); }
   if (m.t === "act") hostRemoteAct(i, m);
   else if (m.t === "ans") { const a = NET.asks[m.id]; if (a && a.seat === i) { delete NET.asks[m.id]; a.res(decodeAns(a.type, a.pl, m.v)); } }
   else if (m.t === "leave") {
@@ -946,22 +962,17 @@ function hostMsg(conn, m) {
     else dropSeat(i, "вышел из партии");
   }
 }
-function hostClosed(conn) {
-  const s = NET.seats.find(x => x.conn === conn); if (!s) return;
-  s.conn = null;
-  if (!NET.started) { NET.seats.splice(NET.seats.indexOf(s), 1); if (NET.open) announceRoom(); }
-  else s.off = s.off || Date.now();
-  render();
-}
-
 function hostTick() {
   const now = Date.now();
   for (const [i, s] of NET.seats.entries()) {
     if (s.cid === CID) continue;
-    if (s.conn && now - s.seen > SILENT_MS) { s.off = s.off || s.seen; try { s.conn.close(); } catch (e) {} s.conn = null; netSync(); }
+    // гость молчит дольше 15 с (он шлёт отметку раз в 5 с): в лобби убираем место, в партии — «нет связи»
+    if (s.conn && now - s.seen > SILENT_MS) {
+      if (!NET.started) { NET.seats.splice(i, 1); if (NET.open) announceRoom(); netSync(); render(); break; }
+      s.off = s.off || s.seen; s.conn = false; netSync(); render();
+    }
     if (NET.started && G && !G.over && s.off && now - s.off > OFFLINE_MS && G.players[i].alive) dropSeat(i, "нет связи больше 2 минут");
   }
-  if (now - NET.lastPing > 5000) { NET.lastPing = now; for (const s of NET.seats) if (s.conn) try { s.conn.send({ t: "ping" }); } catch (e) {} }
   // пока кто-то без связи, раз в секунду обновляем отсчёт до поражения у всех
   if (NET.started && G && !G.over && NET.seats.some(s => s.off) && now - (NET.offPaint || 0) > 1000) { NET.offPaint = now; if (!busy && !pending && !zoom) render(); else netSync(); }
   if (NET.started && G && !G.over && NET.deadline && now >= NET.deadline) timeUp();
@@ -992,7 +1003,7 @@ function timeUp() {
   whenIdle(() => { if (G && !G.over) { log(G, `${P(G).name}: время хода вышло, ход закончен.`, "turn"); humanEnd(); } });
 }
 function whenIdle(fn) { const t = setInterval(() => { if (!busy) { clearInterval(t); fn(); } }, 80); }
-function netTurnStarted() { NET.deadline = Date.now() + TURN_MS; NET.warned = false; NET.autoAnswer = false; netSync(); }
+function netTurnStarted() { NET.deadline = Date.now() + TURN_MS; NET.warned = false; NET.autoAnswer = false; NET.actQ = []; netSync(); }
 
 function defaultAns(type, pl) {
   if (type === "pickOpponent") return pl.opps[0];
@@ -1028,13 +1039,27 @@ function decodeAns(type, pl, v) {
   return +v || 0;
 }
 
+// действие гостя пришло, пока партия занята (идёт прошлое действие или ждём ответа на выбор):
+// почта идёт с задержкой, поэтому не выбрасываем его, а выполняем, как только освободимся
+const hostBusy = () => busy || pending || Object.keys(NET.asks).length;
 function hostRemoteAct(i, m) {
-  if (!G || G.over || P(G).id !== i || busy || pending || Object.keys(NET.asks).length) return;
+  if (!G || G.over || P(G).id !== i) return;
+  if (hostBusy() || (NET.actQ && NET.actQ.length)) {
+    (NET.actQ = NET.actQ || []).push([i, m]);
+    if (!NET.actT) NET.actT = setInterval(drainActs, 80);
+    return;
+  }
   const t = gameAct(m.act, m.id, m.n);
   if (t) sendTo(i, { t: "toast", text: t });
 }
+function drainActs() {
+  if (hostBusy()) return;
+  const x = NET.actQ.shift();
+  if (!NET.actQ.length) { clearInterval(NET.actT); NET.actT = 0; }
+  if (x && G && !G.over && P(G).id === x[0]) { const t = gameAct(x[1].act, x[1].id, x[1].n); if (t) sendTo(x[0], { t: "toast", text: t }); }
+}
 
-function sendTo(i, m) { const s = NET.seats[i]; if (s && s.conn) try { s.conn.send(m); } catch (e) {} }
+function sendTo(i, m) { const s = NET.seats[i]; if (s && s.cid !== CID) relaySend(s.cid, m); }
 // чужие руки и порядок колод не уходят: вместо карт — пустышки той же длины, своя колода — отсортированной
 const hidden = n => Array.from({ length: n }, () => ({ uid: 0, key: "?" }));
 function viewFor(G, i) {
@@ -1092,36 +1117,19 @@ function reportResult(loser = null, reason = "") {
 
 // ---------- гость ----------
 async function netJoin(name, code) {
-  await loadPeer();
-  netReset(); NET.on = true; NET.name = cleanName(name); NET.code = code;
-  // сервер соединений не ответил — ещё две попытки с паузой
-  for (let fails = 0; ; ) {
-    NET.peer = new Peer({ debug: 0 });
-    try { await new Promise((res, rej) => { NET.peer.on("open", res); NET.peer.on("error", rej); }); break; }
-    catch (e) {
-      NET.peer.destroy();
-      if (["server-error", "network", "socket-error", "socket-closed"].includes(e.type) && ++fails < 3) { await new Promise(r => setTimeout(r, 1500 * fails)); continue; }
-      throw new Error(peerErr(e));
-    }
-  }
-  NET.peer.on("error", e => {
-    if (e.type === "peer-unavailable" && !NET.joined) { forgetRoom(); netReset(); onlineErr = peerErr(e); render(); }
-  });
-  NET.peer.on("disconnected", () => { try { NET.peer.reconnect(); } catch (e) {} });
+  netReset(); NET.name = cleanName(name); NET.code = code;
+  // сервер проверит, что такая комната есть и её хозяин на связи
+  await api("relay", { token: ACC.token, code, me: CID, join: true });
+  NET.on = true; NET.conn = true; NET.seen = Date.now();
   // вкладка помнит комнату: после перезагрузки страницы игрок сам вернётся на своё место
   try { sessionStorage.setItem("ba-room", JSON.stringify({ code, name: NET.name })); } catch (e) {}
-  guestConnect();
+  relayStart(); sayHello();
   NET.loop = setInterval(guestTick, 250);
 }
-function guestConnect() {
-  const conn = NET.peer.connect(PEER_PREFIX + NET.code, { reliable: true, serialization: "json" });
-  conn.on("open", () => { NET.conn = conn; NET.seen = Date.now(); NET.hostLostAt = 0; conn.send({ t: "hello", name: NET.name, cid: CID, token: ACC && ACC.token }); render(); });
-  conn.on("data", guestMsg);
-  conn.on("close", () => { if (NET.conn === conn) { NET.conn = null; hostLost(); } });
-}
+function sayHello() { relaySend("host", { t: "hello", name: NET.name, token: ACC && ACC.token }); }
+const toHost = m => relaySend("host", m);
 function guestMsg(m) {
   if (!m || !m.t) return;
-  NET.seen = Date.now();
   if (NET.ended) return; // партия уже закончилась: итог остаётся на экране
   if (m.t === "lobby") { NET.joined = true; NET.started = false; NET.lobby = m.seats; NET.startErr = m.err || ""; G = null;
     Object.assign(NET, { reported: null, rated: null, rateErr: "", animated: false }); pending = null; overlay = null; render(); }
@@ -1135,12 +1143,12 @@ function guestMsg(m) {
   else if (m.t === "ask") {
     if (!G) return;
     const pl = decodePl(m.type, m.pl);
-    pending = { type: m.type, pl, cur: G.cur, id: m.id, res: v => NET.conn && NET.conn.send({ t: "ans", id: m.id, v: encodeAns(m.type, pl, v) }) };
+    pending = { type: m.type, pl, cur: G.cur, id: m.id, res: v => toHost({ t: "ans", id: m.id, v: encodeAns(m.type, pl, v) }) };
     render();
   }
   else if (m.t === "askDone") { if (pending && pending.id === m.id) { pending = null; render(); } }
   else if (m.t === "toast") { showToast(m.text); render(); }
-  else if (m.t === "end") { forgetRoom(); NET.ended = { why: m.why, places: m.places }; clearInterval(NET.loop); reportResult(NET.meta.host, m.why); render(); }
+  else if (m.t === "end") { forgetRoom(); NET.ended = { why: m.why, places: m.places }; clearInterval(NET.loop); relayStop(); reportResult(NET.meta.host, m.why); render(); }
 }
 function setMeta(meta) { NET.meta = meta; NET.deadline = meta.left ? Date.now() + meta.left : 0; }
 function decodePl(type, o) {
@@ -1159,19 +1167,19 @@ function encodeAns(type, pl, v) {
 }
 function guestTick() {
   const now = Date.now();
-  if (NET.conn) {
-    if (now - NET.lastPing > 5000) { NET.lastPing = now; try { NET.conn.send({ t: "ping" }); } catch (e) {} }
-    if (now - NET.seen > SILENT_MS) { const c = NET.conn; NET.conn = null; try { c.close(); } catch (e) {} hostLost(); }
-  } else if (NET.hostLostAt) {
-    if (now - NET.hostLostAt > OFFLINE_MS) hostGone();
-    else if (now - (NET.retryAt || 0) > 5000) { NET.retryAt = now; try { guestConnect(); } catch (e) {} }
-  }
+  // отметка «я на связи» для хозяина раз в 5 с
+  if (now - NET.lastPing > 5000) { NET.lastPing = now; toHost({ t: "ping" }); }
+  // связь пропала: хозяин давно не заходил на сервер или у нас самих не получается достучаться
+  const lost = now - NET.seen > SILENT_MS || (RELAY.failAt && now - RELAY.failAt > SILENT_MS);
+  if (NET.conn && lost) { NET.conn = false; hostLost(); }
+  else if (!NET.conn && !lost) { NET.conn = true; NET.hostLostAt = 0; sayHello(); render(); }
+  else if (!NET.conn && NET.hostLostAt && now - NET.hostLostAt > OFFLINE_MS) hostGone();
   tickTimer();
 }
 function hostLost() { if (NET.ended) return; NET.hostLostAt = NET.hostLostAt || Date.now(); render(); }
 // хозяин комнаты пропал больше чем на 2 минуты: партия окончена, ему поражение, остальным места по здоровью
 function hostGone() {
-  clearInterval(NET.loop); forgetRoom();
+  clearInterval(NET.loop); relayStop(); forgetRoom();
   if (!NET.started || !G || G.over) { netReset(); onlineErr = "Комната закрылась: нет связи с её создателем."; G = null; render(); return; }
   NET.ended = { why: "hostgone", places: places(G, NET.meta.host) };
   reportResult(NET.meta.host, "hostgone");
@@ -1185,9 +1193,11 @@ function netLeave() {
     NET.seats.forEach((s, i) => sendTo(i, { t: "end", why: "hostleft", places: pl }));
     reportResult(NET.seat, "hostleft");
   } else if (NET.host && !NET.started) announceRoom(true);
-  else if (!NET.host && NET.conn) { try { NET.conn.send({ t: "leave" }); } catch (e) {} }
+  else if (!NET.host) toHost({ t: "leave" });
   clearTimeout(NET.syncT); NET.syncT = 0;
-  forgetRoom(); setTimeout(netReset, 300);
+  // последние сообщения (конец партии, «ушёл») уносим сразу, потом останавливаем почту
+  clearTimeout(RELAY.sendT); relayFlush(); setTimeout(relayFlush, 700);
+  forgetRoom(); setTimeout(netReset, 1500);
   NET.on = false; G = null; overlay = null; pending = null; zoom = null; render();
 }
 
@@ -1833,7 +1843,7 @@ async function humanEnd() {
 
 // игровые действия. Гость по сети только отправляет их хозяину комнаты, а здесь они выполняются по-настоящему
 function doGame(act, id, n) {
-  if (NET.on && !NET.host) { if (NET.conn && G && !G.over) NET.conn.send({ t: "act", act, id, n }); return; }
+  if (NET.on && !NET.host) { if (G && !G.over) toHost({ t: "act", act, id, n }); return; }
   const t = gameAct(act, id, n); if (t) showToast(t);
 }
 function gameAct(act, id, n) {
