@@ -859,6 +859,7 @@ const NET = {
   started: false, joined: false,
   deadline: 0, warned: false, autoAnswer: false, asks: {}, askN: 0,
   meta: { off: [] }, hostLostAt: 0, ended: null, syncT: 0, loop: 0, lastPing: 0,
+  actSeq: 0, sentAt: 0, ending: false, // гость: номер последнего отправленного действия и «ход передаётся»
 };
 const TURN_MS = 90000, WARN_MS = 15000, OFFLINE_MS = 120000, SILENT_MS = 15000;
 // у каждой вкладки свой id: по нему хозяин узнаёт вернувшегося игрока
@@ -922,7 +923,8 @@ function netReset() {
   clearInterval(NET.loop); clearTimeout(NET.syncT); relayStop();
   Object.assign(NET, { on: false, host: false, seat: -1, code: "", seats: [], conn: false, lobby: [], started: false, joined: false,
     deadline: 0, warned: false, autoAnswer: false, asks: {}, meta: { off: [] }, hostLostAt: 0, ended: null, syncT: 0, loop: 0,
-    open: false, roomAt: 0, startErr: "", reported: null, rated: null, rateErr: "", animated: false });
+    open: false, roomAt: 0, startErr: "", reported: null, rated: null, rateErr: "", animated: false,
+    actSeq: 0, sentAt: 0, ending: false, actQ: [] });
 }
 
 // ---------- хозяин комнаты ----------
@@ -1046,12 +1048,13 @@ function decodeAns(type, pl, v) {
 // почта идёт с задержкой, поэтому не выбрасываем его, а выполняем, как только освободимся
 const hostBusy = () => busy || pending || Object.keys(NET.asks).length;
 function hostRemoteAct(i, m) {
-  if (!G || G.over || P(G).id !== i) return;
+  if (!G || G.over || P(G).id !== i) { ackAct(i, m); return; }
   if (hostBusy() || (NET.actQ && NET.actQ.length)) {
     (NET.actQ = NET.actQ || []).push([i, m]);
     if (!NET.actT) NET.actT = setInterval(drainActs, 80);
     return;
   }
+  ackAct(i, m);
   const t = gameAct(m.act, m.id, m.n);
   if (t) sendTo(i, { t: "toast", text: t });
 }
@@ -1059,15 +1062,20 @@ function drainActs() {
   if (hostBusy()) return;
   const x = NET.actQ.shift();
   if (!NET.actQ.length) { clearInterval(NET.actT); NET.actT = 0; }
-  if (x && G && !G.over && P(G).id === x[0]) { const t = gameAct(x[1].act, x[1].id, x[1].n); if (t) sendTo(x[0], { t: "toast", text: t }); }
+  if (!x) return;
+  ackAct(x[0], x[1]);
+  if (G && !G.over && P(G).id === x[0]) { const t = gameAct(x[1].act, x[1].id, x[1].n); if (t) sendTo(x[0], { t: "toast", text: t }); }
 }
+// номер последнего обработанного действия гостя уходит вместе со столом: гость понимает,
+// что стол уже учитывает его нажатие, и не откатывает картинку к устаревшему столу
+function ackAct(i, m) { const s = NET.seats[i]; if (s && m.s) s.ack = Math.max(s.ack || 0, m.s); }
 
 function sendTo(i, m) { const s = NET.seats[i]; if (s && s.cid !== CID) relaySend(s.cid, m); }
 // чужие руки и порядок колод не уходят: вместо карт — пустышки той же длины, своя колода — отсортированной
 const hidden = n => Array.from({ length: n }, () => ({ uid: 0, key: "?" }));
 function viewFor(G, i) {
   return {
-    cur: G.cur, turn: G.turn, gold: G.gold, dmg: G.dmg, flags: G.flags, log: G.log.slice(-60), over: G.over, out: G.out,
+    cur: G.cur, turn: G.turn, gold: G.gold, dmg: G.dmg, flags: G.flags, log: G.log.slice(-30).map(l => ({ t: l.t, k: l.k })), over: G.over, out: G.out,
     winner: G.winner ? G.winner.id : null, gameId: G.gameId, gems: G.gems, sacrificed: G.sacrificed, market: G.market, mdeckN: G.mdeck.length, played: G.played,
     players: G.players.map(p => ({ id: p.id, name: p.name, bot: false, hp: p.hp, alive: p.alive, pendingDiscard: p.pendingDiscard, champs: p.champs, discard: p.discard,
       hand: p.id === i ? p.hand : hidden(p.hand.length),
@@ -1080,7 +1088,15 @@ function netSync() {
   NET.syncT = setTimeout(() => {
     NET.syncT = 0; if (!NET.on) return; NET.meta = metaNow();
     if (!NET.started || !G) { const seats = NET.seats.map(s => ({ name: s.name, on: s.cid === CID || !!s.conn })); NET.seats.forEach((s, i) => sendTo(i, { t: "lobby", code: NET.code, seats, err: NET.startErr })); return; }
-    NET.seats.forEach((s, i) => { if (s.cid !== CID) sendTo(i, { t: "state", seat: i, v: viewFor(G, i), meta: NET.meta }); });
+    // тот же самый стол повторно не шлём (раз в 10 с — всё же шлём, чтобы обновить отсчёты)
+    const now = Date.now();
+    NET.seats.forEach((s, i) => {
+      if (s.cid === CID) return;
+      const v = viewFor(G, i), body = JSON.stringify(v) + "|" + (s.ack || 0);
+      if (body === s.lastBody && now - s.lastSent < 10000) return;
+      s.lastBody = body; s.lastSent = now;
+      sendTo(i, { t: "state", seat: i, v, meta: NET.meta, ack: s.ack || 0 });
+    });
   }, 40);
 }
 
@@ -1121,12 +1137,12 @@ function reportResult(loser = null, reason = "") {
 // ---------- гость ----------
 async function netJoin(name, code) {
   netReset(); NET.name = cleanName(name); NET.code = code;
-  // сервер проверит, что такая комната есть и её хозяин на связи
-  await api("relay", { token: ACC.token, code, me: CID, join: true });
+  // сервер проверит, что такая комната есть и её хозяин на связи, и сразу передаст ему «привет»
+  await api("relay", { token: ACC.token, code, me: CID, join: true, out: [{ to: "host", m: { t: "hello", name: NET.name, token: ACC.token } }] });
   NET.on = true; NET.conn = true; NET.seen = Date.now();
   // вкладка помнит комнату: после перезагрузки страницы игрок сам вернётся на своё место
   try { sessionStorage.setItem("ba-room", JSON.stringify({ code, name: NET.name })); } catch (e) {}
-  relayStart(); sayHello();
+  relayStart();
   NET.loop = setInterval(guestTick, 250);
 }
 function sayHello() { relaySend("host", { t: "hello", name: NET.name, token: ACC && ACC.token }); }
@@ -1138,7 +1154,9 @@ function guestMsg(m) {
     Object.assign(NET, { reported: null, rated: null, rateErr: "", animated: false }); pending = null; overlay = null; render(); }
   else if (m.t === "refuse") { forgetRoom(); netReset(); onlineErr = m.why; render(); }
   else if (m.t === "state") {
-    NET.joined = true; NET.started = true; NET.seat = m.seat; setMeta(m.meta); NET.sentAt = 0;
+    // стол ещё не учитывает наше последнее нажатие — оставляем свою картинку (но не дольше 10 с)
+    if (G && NET.started && (m.ack || 0) < NET.actSeq && Date.now() - NET.sentAt < 10000) return;
+    NET.joined = true; NET.started = true; NET.seat = m.seat; setMeta(m.meta); NET.sentAt = 0; NET.ending = false;
     const v = m.v; G = { ...v, mdeck: hidden(v.mdeckN), winner: v.winner != null ? v.players[v.winner] : null };
     if (pending && pending.cur !== G.cur) pending = null;
     render();
@@ -1463,7 +1481,7 @@ function render() {
   const cur = P(G);
   const me = homePlayer();
   const myTurn = me === cur && !cur.bot;
-  const canAct = myTurn && !busy && !handoff && !G.over;
+  const canAct = myTurn && !busy && !handoff && !G.over && !(NET.on && NET.ending);
   const st = { h: me.hp, g: myTurn ? G.gold : 0, d: myTurn ? G.dmg : 0 };
   const pop = k => (lastStats.p === me.id && lastStats[k] !== st[k]) ? " pop" : "";
   const opps = G.players.filter(q => q !== me);
@@ -1845,9 +1863,35 @@ async function humanEnd() {
 
 // игровые действия. Гость по сети только отправляет их хозяину комнаты, а здесь они выполняются по-настоящему
 function doGame(act, id, n) {
-  // гость: действие уходит создателю комнаты и возвращается через сервер за пару секунд — показываем, что нажатие принято
-  if (NET.on && !NET.host) { if (G && !G.over) { toHost({ t: "act", act, id, n }); NET.sentAt = Date.now(); render(); } return; }
+  // гость: действие уходит создателю комнаты и возвращается через сервер за пару секунд,
+  // поэтому результат сразу рисуем у себя, а пришедший потом стол его уточняет
+  if (NET.on && !NET.host) {
+    if (G && !G.over && !NET.ending) { toHost({ t: "act", act, id, n, s: ++NET.actSeq }); NET.sentAt = Date.now(); predict(act, id, n); render(); }
+    return;
+  }
   const t = gameAct(act, id, n); if (t) showToast(t);
+}
+// предсказание для гостя: только то, что точно случится; союзы, выборы и добор карт придут со столом
+function predict(act, id, n) {
+  const me = G.players[NET.seat];
+  switch (act) {
+    case "play": { const c = me.hand.find(x => x.uid == id); if (c) predictPlay(me, c); return; }
+    case "playall": me.hand.slice().forEach(c => predictPlay(me, c)); return;
+    case "exp": { const ch = me.champs.find(x => x.card.uid == id); if (ch) ch.exp = true; return; }
+    case "sac": G.played = G.played.filter(pc => pc.card.uid != id); return;
+    case "buy": { const c = G.market[+id]; if (c && G.gold >= def(c).cost) { G.gold -= def(c).cost; me.discard.push(c); G.market[+id] = null; } return; }
+    case "gem": if (G.gold >= DATA.gem.cost && G.gems > 0) { G.gold -= DATA.gem.cost; G.gems--; } return;
+    case "atk": { const q = G.players[+id], k = Math.min(+n, G.dmg); if (q && k > 0) { q.hp -= k; G.dmg -= k; } return; }
+    case "atk-ch": { const [qi, uid] = String(id).split(":"); const q = G.players[+qi]; const ch = q && q.champs.find(x => x.card.uid == uid); if (ch) { q.champs = q.champs.filter(x => x !== ch); G.dmg -= def(ch.card).df; } return; }
+    case "end-yes": NET.ending = true; return; // пока ход передаётся, кнопки неактивны
+  }
+}
+function predictPlay(me, c) {
+  me.hand = me.hand.filter(x => x !== c);
+  const d = def(c);
+  if (d.type === "champ") { me.champs.push({ card: c, exp: false }); return; }
+  G.played.push({ card: c });
+  for (const [t, a] of d.prim || []) { if (t === "gold") G.gold += a; if (t === "dmg") G.dmg += a; }
 }
 function gameAct(act, id, n) {
   switch (act) {
